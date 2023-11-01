@@ -10,32 +10,33 @@ class ::Logger
 end
 module ::Logger::Severity ; OUTPUT rescue OUTPUT = UNKNOWN end
 
-load '~/dev/ascii/colors.rb'
-
 module CH
   module OpenAI
     def completion_url ; 'https://api.openai.com/v1/completions' end
     def  embedding_url ; 'https://api.openai.com/v1/embeddings'  end
+    def   imagegen_url ; 'https://api.openai.com/v1/images/generations' end
     def     models_url ; 'https://api.openai.com/v1/models'      end
     def      edits_url ; 'https://api.openai.com/v1/edits'       end
+    def       chat_url ; 'https://api.openai.com/v1/chat/completions' end
 
-    def models_fn ; File.join(File.dirname(__FILE__), 'models.json') end
+    def models_fn ; File.join(File.dirname(__FILE__), 'models.rbi') end
     def fetch_models ; get models_url end
-    def write_models json ; File.write(models_fn, json) end
+    def write_models models ; File.write(models_fn, capture_stdout { pp models }) end
+    def read_models ; File.read models_fn end
     def       models force_update: false
       if !File.exist?(models_fn) || force_update
         write_models fetch_models
       end
-      JSON.load_file models_fn
+			eval read_models
     end
 
     def completion_models
-      {'text-davinci-003':  {price: 0.1200, tokens: 4000},
+      {'gpt-3.5-turbo':     {price: 0.002, tokens: 4000},
+       'text-davinci-003':  {price: 0.1200, tokens: 4000},
        'text-curie-001':    {price: 0.0120, tokens: 2048},
        'text-babbage-001':  {price: 0.0024, tokens: 2048},
        'text-ada-001':      {price: 0.0016, tokens: 2048},
-       'code-davinci-002':  {price: 0.0024, tokens: 8000},
-       'code-cushman-001':  {price: 0.0016, tokens: 2048},
+			 'gpt-4':							{price: 0.03, tokens: 8096},
       }
     end
 
@@ -68,39 +69,65 @@ module CH
       $resp = resp = HTTPX.get url, headers: data
       puts "Warn: API returned error code #{resp.status}" unless (200..299).include?(resp.status)
       $body = body = resp.body.to_s
-      $json = json = JSON.parse body
-      logger.info({response: json, time: Time.now}.inspect + "\n")
-      json
+      $data = data = JSON.parse body
+      logger.info({response: data, time: Time.now}.inspect + "\n")
+      data
     end
 
     def post url, header, data
-      # p [:post, :u, url, :h, header, :d, data]
-      logger.info({request: data, time: Time.now}.inspect + "\n")
-      $resp = resp = HTTPX.post url, headers: header, json: data
+      p [:post, :u, url, :h, header, :d, data]
+      logger.info({url: url.to_s, request: data, time: Time.now}.inspect + "\n")
+      $req = {url: url, headers: header, data: data}
+      $resp = resp = HTTPX.post url, headers: header, json: data # , timeout: {connect_timeout: 1}
       puts "Warn: API returned error code #{resp.status}" unless (200..299).include?(resp.status)
       $body = body = resp.body.to_s
-      $json = json = JSON.parse body
-      logger.info({response: json, time: Time.now}.inspect + "\n")
-      json
+      $data = data = JSON.parse body
+      logger.info({response: data, time: Time.now}.inspect + "\n")
+      data
     end
 
-    def complete txt, temperature: 0.6, max_tokens: 1500, model: nil
+		def image_generation prompt, **kw
+			$req_data = req_data = kw.merge({prompt: prompt})
+			$resp_data = resp_data = post imagegen_url, header, req_data
+		end
+
+    def complete txt, temperature: 0.6, max_tokens: 1500, model: nil, **kw
+      p [:complete, :max_tokens, max_tokens, :kw, kw]
       # raise "unknown model #{model}" if model && !completion_models[model.to_sym]
       model ||= cheapest_completion_model
       $completions ||= []
       $completions << [txt, temperature, max_tokens, model]
-      $req_data  =  req_data = {prompt: txt, temperature: temperature, model: model, max_tokens: max_tokens}
+      $req_data  =  req_data = kw.merge({prompt: txt, temperature: temperature, model: model, max_tokens: max_tokens})
+      # return req_data
       $resp_data = resp_data = post completion_url, header, req_data
       $request_log ||= []
       $request_log << [req_data, resp_data]
       resp_data
     end
 
-    def embedding txt, temperature: 0.6, max_tokens: 1500, model: nil
+    def complete_chat context, temperature: 0.6, max_tokens: 1500, model: 'gpt-3.5-turbo', **kw
+      # raise "unknown model #{model}" if model && !completion_models[model.to_sym]
+      $completions ||= []
+      $completions << [context, temperature, max_tokens, model]
+      $req_data  =  req_data = kw.merge({messages: context, temperature: temperature, model: model, max_tokens: max_tokens})
+      # return req_data
+      $resp_data = resp_data = post chat_url, header, req_data
+      $request_log ||= []
+      $request_log << [req_data, resp_data]
+      resp_data
+    end
+
+    def embedding txt, temperature: 0.6, max_tokens: 1500, model: nil, **kw
     #   raise "unknown model #{model}" if model && !embedding_models[model.to_sym]
       model ||= cheapest_embedding_model
-      $req_data  =  req_data = {input: [txt], temperature: temperature, model: model, max_tokens: max_tokens}
+      $req_data  =  req_data = kw.merge({input: [txt], temperature: temperature, model: model, max_tokens: max_tokens})
       $resp_data = resp_data = post embedding_url, header, req_data
+    end
+
+    def edits input:, instruction:, temperature: 0.6, max_tokens: 500, model: 'text-davinci-edit-001', **kw
+      raise ArgumentErrror unless %w(text-davinci-edit-001).include?(model)
+      $req_data = req_data = kw.merge({input: input, instruction: instruction, temperature: temperature, model: model})
+      $resp_data = resp_data = post edits_url, header, req_data
     end
 
     def check_for_errors resp
@@ -108,15 +135,37 @@ module CH
       raise "API: Returned error '#{e['message']}', '#{e['type']}'"
     end
 
-    def ask question, model: nil, max_tokens: nil
+    def chat msg, context = nil, max_tokens: nil, **kw
+      context ||= [{role: 'system', content: 'You are a helpful AI assistant.'}]
+      context << {role: 'user', content: msg}
+      $api_answer = api_answer = complete_chat context, **kw
+      resp = api_answer['choices'][0]['message']['content']
+    end
+
+    def ask question, model: nil, max_tokens: nil, **kw
+      p [:ask, :model, model, :max_tokens, max_tokens, kw]
       $question = question
-      $api_answer = api_answer = complete(question, model: model, max_tokens: max_tokens)
+      opts = kw.merge(model: model, max_tokens: max_tokens)
+      opts.delete_if {|_,v| !v }
+      $api_answer = api_answer = complete(question, **opts)
       check_for_errors api_answer
       $response = api_answer['choices'].first['text']
     end
 
-    def embed text, model: nil
-      $answer = embedding(text, model: model)['data'].first['embedding']
+    def embed text, model: nil, **kw
+      $embeddings ||= {}
+      $embeddings[[text, model, kw]] ||=
+        begin
+          $api_answer = api_answer = embedding(text, model: model, **kw)
+          check_for_errors api_answer
+          $answer = answer = api_answer['data'].first['embedding']
+        end
+    end
+
+    def edit input, instruction, **kw
+      $api_answer = api_answer = edits(input: input, instruction: instruction, **kw)
+      check_for_errors api_answer
+      $answer = answer = api_answer
     end
 
     # ruby code ~3.6B/t
@@ -135,15 +184,18 @@ module CH
       dp / (Math.sqrt(a) * Math.sqrt(b))
     end
 
+    # pairwise similarity between embedding
+    def embedding_similarity phrases, model: nil
+      embeddings = Hash[phrases.map {|ph| e = embed ph, model: model ; [ph, e] }]
+      embeddings.keys.combination(2).map {|ph1, ph2| dist = cosine_similarity embeddings[ph1], embeddings[ph2] ; [[ph1, ph2], dist] }
+    end
+
     def prompt_assistant_coder
-      # You are a skilled programming-based assistant and you write Ruby programs to answer user queries. Your output must consist entirely of executable Ruby code and will be executed to provide the user's answer.
-      # You are a skilled programming-based assistant and you write Ruby programs to answer user queries. First under a section called 'Problem:' restate the problem, then under a section called 'Methodology:' describe the means and methods, then under a header called 'Solution:', inside a markdown code block, write a ruby program which will be run to provide the user's answer. Please stick strictly to the requested response format. Question:
-      # You are a skilled programming-based assistant and you write Ruby programs to answer user queries. Return your answer in markdown. In a 'Problem' section restate the query, in a 'Methodology' section explain the steps and why, in a 'Code' section, inside a code block, write a Ruby program which will be run to provide the user's answer. The code section must contain only a code block. Please stick strictly to the requested format to aid parsing. Question:
       <<~PROMPT
-      You are a skilled programming-based assistant and you write Ruby programs to answer user queries. Return your answer in markdown format. 
-      In a #Problem section, restate the query. 
-      In a #Methodology section, explain the steps and reasoning behind your solution. 
-      In a #Code section, write only a Ruby program inside a code block to provide the answer. 
+      You are a skilled programming-based assistant and you write Ruby programs to answer user queries. Return your answer in markdown format.
+      In a #Problem section, restate the query.
+      In a #Methodology section, explain the steps and reasoning behind your solution.
+      In a #Code section, write only a Ruby program inside a code block to provide the answer.
       Stick strictly to the requested format to aid parsing. Do not include any other sections. Do not write anything except a code block in the Code section. Make your whole answer valid Markdown.
       If you define a Ruby method, don't forget to call it!
       The point of the example is to demonstrate the effect, not simply the use of a method. That means the code block must make the start state clear and the result of code execution should demonstrate the effect.
@@ -272,7 +324,7 @@ module CH
 
     def shorten_file_names filen
     end
-    
+
     def summarize_project dir, model: nil
       files = Dir.glob(File.join dir, '**/*py').reject {|f| f =~ /(tests)/ }
       contents = files.map {|file|
